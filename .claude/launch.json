@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dbarchivemgr",
+      "runtimeExecutable": "./dbarchivemgr/bin/dbam",
+      "runtimeArgs": ["-dsn", "file::memory:?cache=shared"],
+      "port": 8090
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+bin/
+dbarchivemgr/bin/
+
+# Tooling / session artifacts
+.playwright-mcp/
+.claude/settings.local.json
+
+# Go
+*.test
+*.out
