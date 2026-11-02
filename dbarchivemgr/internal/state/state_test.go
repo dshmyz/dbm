@@ -61,13 +61,23 @@ func TestArchiveResultSizeInvalid(t *testing.T) {
 	}
 }
 
-func TestOnRollingFromFailed(t *testing.T) {
-	// 从 ARCHIVE_FAILED 不应直接下发到 ARCHIVING 之外的状态
+func TestSuccessFromFailureState(t *testing.T) {
+	// 判超时/失败后大数据其实成功：成功结果应从 ARCHIVE_FAILED 收敛到 ARCHIVED，不被拒绝
 	meta := &model.BackupMeta{ArchiveStatus: model.StatusArchiveFailed}
-	if err := OnRetry(meta); err != nil {
+	if err := OnArchiveResult(meta, true); err != nil {
+		t.Fatalf("成功结果应被接受, got err=%v", err)
+	}
+	if meta.ArchiveStatus != model.StatusArchived {
+		t.Fatalf("应收敛到 ARCHIVED, got %s", meta.ArchiveStatus)
+	}
+}
+
+func TestSuccessIdempotentOnArchived(t *testing.T) {
+	meta := &model.BackupMeta{ArchiveStatus: model.StatusArchived}
+	if err := OnArchiveResult(meta, true); err != nil {
 		t.Fatal(err)
 	}
-	if meta.ArchiveStatus != model.StatusArchiving {
-		t.Fatalf("重试应到 ARCHIVING, got %s", meta.ArchiveStatus)
+	if meta.ArchiveStatus != model.StatusArchived {
+		t.Fatalf("ARCHIVED 重复成功应幂等, got %s", meta.ArchiveStatus)
 	}
 }

@@ -36,6 +36,10 @@ type Middleware struct {
 	ValidatePath string // ticket 校验路径（默认 /p3/proxyValidate；CAS 2.x 服务端可用 /serviceValidate）
 	PublicURL    string // 本服务对外地址（构造 service 参数用；空则按请求 Host 推导）
 
+	// MachineToken 机器回调共享密钥。非空时，白名单回调必须带 X-Machine-Token（或
+	// Authorization: Bearer）且匹配；空 = 不校验（演示/向后兼容）。
+	MachineToken string
+
 	mu       sync.Mutex
 	sessions map[string]session
 }
@@ -78,6 +82,12 @@ func (m *Middleware) Require() gin.HandlerFunc {
 		}
 		p := c.Request.URL.Path
 		if whitelist[p] {
+			// 配了机器密钥就校验回调令牌；未配则放行（演示/向后兼容）
+			if m.MachineToken != "" && !m.validMachine(c.Request) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized,
+					gin.H{"code": 401, "message": "机器回调令牌无效", "data": nil})
+				return
+			}
 			c.Next()
 			return
 		}
@@ -95,6 +105,17 @@ func (m *Middleware) Require() gin.HandlerFunc {
 		c.Redirect(http.StatusFound, "/auth/login")
 		c.Abort()
 	}
+}
+
+// validMachine 校验机器回调密钥：X-Machine-Token 头，或 Authorization: Bearer。
+func (m *Middleware) validMachine(r *http.Request) bool {
+	if t := r.Header.Get("X-Machine-Token"); t != "" && t == m.MachineToken {
+		return true
+	}
+	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+		return strings.TrimPrefix(a, "Bearer ") == m.MachineToken
+	}
+	return false
 }
 
 /* ---------------- /auth 端点 ---------------- */

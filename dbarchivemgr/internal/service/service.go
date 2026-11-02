@@ -40,6 +40,7 @@ type Service struct {
 	// Notifier 补发指令下发出口（走 HTTP 推送给外部组件）。为 nil 时不下发。
 	Notifier notify.ReplenishNotifier
 	// ArchiveNotifier 归档清单下发出口（走 HTTP 推给大数据自治拉取）。为 nil 时不下发。
+	// 多机房配置（tb_gfs_endpoint）时按主卷机房分发，此项为兜底/单地址出口。
 	ArchiveNotifier notify.ArchiveNotifier
 
 	// 参数
@@ -59,6 +60,35 @@ func New(db *gorm.DB, fs gfsclient.FileStore) *Service {
 		minFileSize: sim.MinFileSize,
 		retryMax:    3,
 	}
+}
+
+// endpointTimeout 出站超时：机房端点显式配置（秒）优先，否则用默认 30s。
+func (s *Service) endpointTimeout(sec int) time.Duration {
+	if sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	return gfsclient.DefaultTimeout
+}
+
+// audit 写一条操作流水（META_REPORT/REPLENISH/ROLLING/ARCHIVE/CLEAN/SWEEP）。
+// 留痕为尽力而为：写入失败不阻断主流程。
+func (s *Service) audit(action string, backupID uint, detail string) {
+	s.db.Create(&model.AuditLog{Action: action, BackupID: backupID, Detail: detail})
+}
+
+// logVerify 写一条「存在 + size」校验留痕（tb_file_verify_log）。
+// chain=WRITE(DB写双卷)/ARCHIVE(GFS→大数据)；vol 为 city/dr；stage 为 STAT_EXIST/STAT_SIZE/ARCHIVE_SIZE。
+func (s *Service) logVerify(backupID uint, chain, vol, stage string, expected, actual int64, result string) {
+	vl := model.FileVerifyLog{
+		BackupID: backupID, Chain: chain, Volumn: strings.ToUpper(vol), Stage: stage,
+		SizeExpected: expected, SizeActual: actual,
+		ExistsFlag: actual > 0, Result: result,
+	}
+	if result == "VERIFIED" {
+		now := time.Now()
+		vl.VerifiedAt = &now
+	}
+	s.db.Create(&vl)
 }
 
 // --- 机房路由（多 GFS 管理端） ---
@@ -98,7 +128,7 @@ func (s *Service) regionSource() gfsclient.RegionSource {
 	stores := make(map[string]gfsclient.FileStore, len(eps))
 	for _, e := range eps {
 		if e.BaseURL != "" {
-			stores[e.Region] = gfsclient.NewHTTP(e.BaseURL)
+			stores[e.Region] = gfsclient.NewHTTPTimeout(e.BaseURL, s.endpointTimeout(e.TimeoutSec))
 		}
 	}
 	if len(stores) == 0 {
@@ -192,6 +222,7 @@ func (s *Service) UpdateGfsEndpoint(id uint, in *model.GfsEndpoint) (*model.GfsE
 	if in.BaseURL != "" {
 		e.BaseURL = in.BaseURL
 	}
+	e.TimeoutSec = in.TimeoutSec
 	e.Remark = in.Remark
 	if err := s.db.Save(&e).Error; err != nil {
 		return nil, err
@@ -664,13 +695,6 @@ func (s *Service) ReportBackupMeta(hostIP, dbName string, date time.Time, editio
 		return nil, fmt.Errorf("库未绑定集群: %w", err)
 	}
 
-	// 由 DB 上报前应已通过「双卷存在+非空」校验；此处复核一次。
-	// 多机房模式下主卷/对卷分属主/对机房的 GFS 管理端，分别复核。
-	mainVol, peerVol := mainVolOf(edition), peerVolOf(edition)
-	if !s.volStore(cl, mainVol).Exists(gfsPath) || !s.volStore(cl, peerVol).Exists(peerGfsPath) {
-		return nil, errors.New("上传判定未通过：双卷文件不存在或未达阈值")
-	}
-
 	date = date.UTC().Truncate(24 * time.Hour)
 
 	meta := model.BackupMeta{}
@@ -678,6 +702,20 @@ func (s *Service) ReportBackupMeta(hostIP, dbName string, date time.Time, editio
 		cl.ID, dbm.ID, date, edition).First(&meta).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
+	}
+
+	// 终态/归档中锁定：重复上报（DB 重试、消息重投）不得复位 ARCHIVING/ARCHIVED，
+	// 即使文件已随归档清理也幂等返回原记录，不触发补发。
+	if meta.ID != 0 && (meta.ArchiveStatus == model.StatusArchiving ||
+		meta.ArchiveStatus == model.StatusArchived) {
+		return &meta, nil
+	}
+
+	// 由 DB 上报前应已通过「双卷存在+非空」校验；此处复核一次。
+	// 多机房模式下主卷/对卷分属主/对机房的 GFS 管理端，分别复核。
+	mainVol, peerVol := mainVolOf(edition), peerVolOf(edition)
+	if !s.volStore(cl, mainVol).Exists(gfsPath) || !s.volStore(cl, peerVol).Exists(peerGfsPath) {
+		return nil, errors.New("上传判定未通过：双卷文件不存在或未达阈值")
 	}
 
 	now := time.Now()
@@ -714,6 +752,11 @@ func (s *Service) ReportBackupMeta(hostIP, dbName string, date time.Time, editio
 			return nil, err
 		}
 	}
+	// 留痕：链路A 双卷「存在 + size」判定 + 上报流水
+	s.logVerify(meta.ID, "WRITE", mainVol, "STAT_SIZE", s.minFileSize, meta.FileSizeBytes, "VERIFIED")
+	s.logVerify(meta.ID, "WRITE", peerVol, "STAT_SIZE", s.minFileSize, meta.PeerFileSizeBytes, "VERIFIED")
+	s.audit("META_REPORT", meta.ID, fmt.Sprintf("%s %s size=%d",
+		dbName, meta.BackupDate.Format("2006-01-02"), meta.FileSizeBytes))
 	return &meta, nil
 }
 
@@ -723,16 +766,20 @@ type InspectResult struct {
 	TotalSlots   int
 	MissingList  []model.InspectMissing
 	MissingCount int
+	BrokenCount  int
 	OKCount      int
 }
 
 // RunInspect 每日完整性巡检（对应 POST /api/v1/inspect/run）。
 // 遍历近 windowDays 天所有（集群,库,版本）应备槽位，stat 判定存在+非空。
+// 已归档（文件可能已随正常清理删除）或已清理的记录不再纳入，避免把正常清理误判为缺失。
 func (s *Service) RunInspect(targetDate time.Time, windowDays int) (*InspectResult, error) {
 	target := targetDate.UTC().Truncate(24 * time.Hour)
-	// 该日应生成的全量备份
+	// 该日应生成的全量备份（排除已归档/已清理记录）
 	metaList := []model.BackupMeta{}
-	if err := s.db.Where("backup_date >= ?", target.AddDate(0, 0, -windowDays)).
+	if err := s.db.
+		Where("backup_date >= ? AND archive_status <> ? AND deleted_at IS NULL",
+			target.AddDate(0, 0, -windowDays), model.StatusArchived).
 		Find(&metaList).Error; err != nil {
 		return nil, err
 	}
@@ -761,6 +808,7 @@ func (s *Service) RunInspect(targetDate time.Time, windowDays int) (*InspectResu
 		mt := "MISSING"
 		if exists, sz := s.volStore(cl, mainVolOf(m.BackupEdition)).Stat(m.GFSPath); exists && sz <= s.minFileSize {
 			mt = "BROKEN" // 半截/空文件
+			res.BrokenCount++
 		}
 		res.MissingList = append(res.MissingList, model.InspectMissing{
 			ClusterID: m.ClusterID, DBID: m.DBID, DBName: m.DBName,
@@ -769,12 +817,12 @@ func (s *Service) RunInspect(targetDate time.Time, windowDays int) (*InspectResu
 		})
 	}
 
+	res.MissingCount = len(res.MissingList)
 	ins := model.Inspect{
 		InspectDate: time.Now(), TargetDate: target, Scope: "ALL",
-		TotalSlots: res.TotalSlots, MissingCount: len(res.MissingList),
-		OKCount: res.OKCount, Status: "DONE",
+		TotalSlots: res.TotalSlots, MissingCount: res.MissingCount,
+		BrokenCount: res.BrokenCount, OKCount: res.OKCount, Status: "DONE",
 	}
-	res.MissingCount = len(res.MissingList)
 	if err := s.db.Create(&ins).Error; err != nil {
 		return nil, err
 	}
@@ -802,6 +850,15 @@ func (s *Service) CreateReplenishTask(clusterID, dbID uint, dbName string, date 
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
+	}
+
+	// 已归档/归档中的备份不再补发：文件可能已正常清理，或大数据正在拉取
+	var guard model.BackupMeta
+	if err := s.db.Where("cluster_id = ? AND db_id = ? AND backup_date = ? AND backup_edition = ?",
+		clusterID, dbID, date.UTC().Truncate(24*time.Hour), edition).First(&guard).Error; err == nil {
+		if guard.ArchiveStatus == model.StatusArchived || guard.ArchiveStatus == model.StatusArchiving {
+			return nil, fmt.Errorf("备份已归档/归档中，无需补发: %s", guard.ArchiveStatus)
+		}
 	}
 
 	task := model.ReplenishTask{
@@ -842,6 +899,8 @@ func (s *Service) CreateReplenishTask(clusterID, dbID uint, dbName string, date 
 			return nil, fmt.Errorf("补发指令推送失败: %w", err)
 		}
 	}
+	s.audit("REPLENISH", 0, fmt.Sprintf("task=%s db=%s date=%s",
+		task.TaskID, dbName, task.BackupDate.Format("2006-01-02")))
 	return &task, nil
 }
 
@@ -859,7 +918,7 @@ func (s *Service) notifyReplenish(cl *model.Cluster, vol string, item notify.Rep
 			}
 		}
 		if fs, ok := src.For(region).(*gfsclient.HTTPFileStore); ok {
-			return notify.NewHTTP(fs.Base).Notify(item)
+			return notify.NewHTTPTimeout(fs.Base, fs.Timeout).Notify(item)
 		}
 	}
 	if s.Notifier != nil {
@@ -883,8 +942,14 @@ func (s *Service) CompleteReplenish(taskID string, success bool, gfsPath string,
 		if err := s.db.Where("cluster_id = ? AND db_id = ? AND backup_date = ? AND backup_edition = ?",
 			t.ClusterID, t.DBID, t.BackupDate, t.BackupEdition).First(&meta).Error; err == nil {
 			if gfsPath != "" {
-				meta.GFSPath = gfsPath
-				meta.FileSizeBytes = size
+				// 回调路径等于对卷路径即补的是对卷，更新对卷字段，不覆盖主卷路径
+				if gfsPath == meta.PeerGFSPath {
+					meta.PeerGFSPath = gfsPath
+					meta.PeerFileSizeBytes = size
+				} else {
+					meta.GFSPath = gfsPath
+					meta.FileSizeBytes = size
+				}
 			}
 			meta.IsReplenished = true
 			meta.ReplenishTaskID = taskID
@@ -898,7 +963,11 @@ func (s *Service) CompleteReplenish(taskID string, success bool, gfsPath string,
 			t.Status = "FAILED"
 		}
 	}
-	return s.db.Save(&t).Error
+	if err := s.db.Save(&t).Error; err != nil {
+		return err
+	}
+	s.audit("REPLENISH", 0, fmt.Sprintf("task=%s status=%s retry=%d", t.TaskID, t.Status, t.RetryCount))
+	return nil
 }
 
 // effectiveWindow 归档窗口：库级 → 集群级 → 全局默认 15。
@@ -923,14 +992,16 @@ func (s *Service) effectiveRetention(cl *model.Cluster) int {
 
 // ArchiveItemFlat 滚动清单条目。
 type ArchiveItemFlat struct {
-	ArchiveItemID uint
-	BackupID      uint
-	ClusterCode   string
-	DBName        string
-	BackupDate    time.Time
-	BackupEdition model.BackupEdition
-	GFSPath       string
-	FileSizeBytes int64
+	ArchiveItemID uint   `json:"archiveItemId"`
+	BackupID      uint   `json:"backupId"`
+	ClusterCode   string `json:"clusterCode"`
+	DBName        string `json:"dbName"`
+	BackupDate    time.Time    `json:"backupDate"`
+	BackupEdition model.BackupEdition `json:"backupEdition"`
+	GFSPath       string       `json:"gfsPath"`
+	FileSizeBytes int64        `json:"fileSizeBytes"`
+	// Region 主卷所在机房（同城卷→cityRegion / 异地卷→drRegion），多机房按此分发归档清单
+	Region string `json:"region"`
 }
 
 // GenerateRollingList 生成滚动归档清单（对应 POST /api/v1/archive/rolling-list/generate）。
@@ -938,71 +1009,158 @@ type ArchiveItemFlat struct {
 // 有效窗口（库级 ArchiveWindowDays → 集群 → 默认15）的备份。元数据去重，每份只归档一次。
 func (s *Service) GenerateRollingList(cutoff time.Time) (string, []ArchiveItemFlat, error) {
 	cutoff = cutoff.UTC().Truncate(24 * time.Hour)
-	batch := model.ArchiveBatch{
-		ID:           fmt.Sprintf("ARC%d", time.Now().UnixNano()),
-		GenerateTime: time.Now(), CutoffDate: cutoff,
-		Status: "GENERATED",
+
+	var (
+		batchID string
+		items   []ArchiveItemFlat
+	)
+	// 事务内完成「候选筛选 → 条件抢占 → 批次/条目落库」，保证并发触发不会重复下发。
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		batch := model.ArchiveBatch{
+			ID:           fmt.Sprintf("ARC%d", time.Now().UnixNano()),
+			GenerateTime: time.Now(), CutoffDate: cutoff,
+			Status: "GENERATED",
+		}
+
+		// 候选：未归档或上次失败（失败直接由下轮清单重试，不另设复位工序），且上传判定通过
+		pendingStates := []model.ArchiveStatus{model.StatusNotArchived, model.StatusArchiveFailed}
+		var metas []model.BackupMeta
+		if err := tx.Where("archive_status IN ? AND upload_verify = ?",
+			pendingStates, model.VerifyVerified).Find(&metas).Error; err != nil {
+			return err
+		}
+
+		// 按 DBID 懒加载缓存各自的有效窗口与机房（DB/集群只查一次）
+		type winRec struct {
+			window     int
+			code       string
+			cityRegion string
+			drRegion   string
+		}
+		winByDB := map[uint]winRec{}
+		var winFor = func(m *model.BackupMeta) winRec {
+			if r, ok := winByDB[m.DBID]; ok {
+				return r
+			}
+			var dbm model.DB
+			if err := tx.First(&dbm, m.DBID).Error; err == nil {
+				var cl model.Cluster
+				tx.First(&cl, dbm.ClusterID)
+				winByDB[m.DBID] = winRec{s.effectiveWindow(&dbm, &cl), cl.ClusterCode, cl.CityRegion, cl.DRRegion}
+			}
+			return winByDB[m.DBID]
+		}
+
+		items = make([]ArchiveItemFlat, 0, len(metas))
+		maxWindow := 0
+		for i := range metas {
+			m := &metas[i]
+			rec := winFor(m)
+			// 已过该库的归档窗口才纳入
+			if m.BackupDate.After(cutoff.AddDate(0, 0, -rec.window)) {
+				continue
+			}
+			// 条件抢占：仍为 未归档/失败 才能置 ARCHIVING 并记下批次；RowsAffected=0 即被并发拿走
+			res := tx.Model(&model.BackupMeta{}).
+				Where("id = ? AND archive_status IN ?", m.ID, pendingStates).
+				Updates(map[string]any{
+					"archive_status":  model.StatusArchiving,
+					"archive_batch_id": batch.ID,
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				continue
+			}
+			m.ArchiveStatus = model.StatusArchiving
+			m.ArchiveBatchID = batch.ID
+			// 主卷所在机房：同城卷→cityRegion，异地卷→drRegion（多机房按此分发清单）
+			region := rec.cityRegion
+			if mainVolOf(m.BackupEdition) == sim.VolDR {
+				region = rec.drRegion
+			}
+			items = append(items, ArchiveItemFlat{
+				BackupID: m.ID, ClusterCode: rec.code, DBName: m.DBName,
+				BackupDate: m.BackupDate, BackupEdition: m.BackupEdition,
+				GFSPath: m.GFSPath, FileSizeBytes: m.FileSizeBytes,
+				Region: region,
+			})
+			if rec.window > maxWindow {
+				maxWindow = rec.window
+			}
+		}
+
+		// 零项不建批次（避免每天累积空批次）
+		if len(items) == 0 {
+			return nil
+		}
+
+		batch.WindowDays = maxWindow
+		batch.ItemCount = len(items)
+		if err := tx.Create(&batch).Error; err != nil {
+			return err
+		}
+		batchID = batch.ID
+		for i := range items {
+			it := model.ArchiveItem{
+				ArchiveBatchID: batch.ID, BackupID: items[i].BackupID,
+				TransferStatus: model.TransferPending,
+			}
+			if err := tx.Create(&it).Error; err != nil {
+				return err
+			}
+			items[i].ArchiveItemID = it.ID
+		}
+		return nil
+	})
+	if txErr != nil {
+		return "", nil, txErr
+	}
+	// 留痕：批次纳入流水（按备份逐条）
+	for _, it := range items {
+		s.audit("ROLLING", it.BackupID, fmt.Sprintf("batch=%s path=%s", batchID, it.GFSPath))
 	}
 
-	// 候选：NOT_ARCHIVED 且上传判定通过
-	var metas []model.BackupMeta
-	if err := s.db.Where("archive_status = ? AND upload_verify = ?",
-		model.StatusNotArchived, model.VerifyVerified).Find(&metas).Error; err != nil {
-		return "", nil, err
-	}
-
-	// 按 DBID 懒加载缓存各自的有效窗口（DB/集群只查一次）
-	type winRec struct {
-		window int
-		code   string
-	}
-	winByDB := map[uint]winRec{}
-	var winFor = func(m *model.BackupMeta) winRec {
-		if r, ok := winByDB[m.DBID]; ok {
-			return r
+	// 清单下发走 HTTP（事务外，避免外部调用持有事务）：推给大数据组件自治拉取→写HDFS→回调。
+	// 多机房（tb_gfs_endpoint）按主卷机房分组逐机房推送，失败只回滚该机房条目；单地址整批推送。
+	if src := s.regionSource(); src != nil {
+		byRegion := map[string][]ArchiveItemFlat{}
+		var order []string
+		for _, it := range items {
+			if _, ok := byRegion[it.Region]; !ok {
+				order = append(order, it.Region)
+			}
+			byRegion[it.Region] = append(byRegion[it.Region], it)
 		}
-		var dbm model.DB
-		if err := s.db.First(&dbm, m.DBID).Error; err == nil {
-			var cl model.Cluster
-			s.db.First(&cl, dbm.ClusterID)
-			winByDB[m.DBID] = winRec{s.effectiveWindow(&dbm, &cl), cl.ClusterCode}
+		for _, region := range order {
+			group := byRegion[region]
+			var cands []notify.ArchiveCandidate
+			for _, it := range group {
+				cands = append(cands, notify.ArchiveCandidate{
+					ArchiveItemID: it.ArchiveItemID, BackupID: it.BackupID,
+					GFSPath: it.GFSPath, FileSizeBytes: it.FileSizeBytes,
+				})
+			}
+			fs, ok := src.For(region).(*gfsclient.HTTPFileStore)
+			if ok {
+				if err := notify.NewHTTPArchiveTimeout(fs.Base, fs.Timeout).NotifyArchive(batchID, cands); err != nil {
+					s.failBatch(batchID, group)
+					return "", nil, fmt.Errorf("归档清单推送失败(机房 %s): %w", region, err)
+				}
+				continue
+			}
+			// 机房未配置端点：回落单地址出口；连单地址都没有则该机房条目回滚重试
+			if s.ArchiveNotifier == nil {
+				s.failBatch(batchID, group)
+				return "", nil, fmt.Errorf("归档清单推送失败: 机房 %s 无可用管理端", region)
+			}
+			if err := s.ArchiveNotifier.NotifyArchive(batchID, cands); err != nil {
+				s.failBatch(batchID, group)
+				return "", nil, fmt.Errorf("归档清单推送失败(机房 %s): %w", region, err)
+			}
 		}
-		return winByDB[m.DBID]
-	}
-
-	items := make([]ArchiveItemFlat, 0, len(metas))
-	maxWindow := 0
-	for _, m := range metas {
-		rec := winFor(&m)
-		// 已过该库的归档窗口才纳入
-		if m.BackupDate.After(cutoff.AddDate(0, 0, -rec.window)) {
-			continue
-		}
-		items = append(items, ArchiveItemFlat{
-			BackupID: m.ID, ClusterCode: rec.code, DBName: m.DBName,
-			BackupDate: m.BackupDate, BackupEdition: m.BackupEdition,
-			GFSPath: m.GFSPath, FileSizeBytes: m.FileSizeBytes,
-		})
-		if rec.window > maxWindow {
-			maxWindow = rec.window
-		}
-		// 置为归档中（状态机）
-		state.OnRollingSubmit(&m)
-		s.db.Save(&m)
-	}
-
-	batch.WindowDays = maxWindow
-	batch.ItemCount = len(items)
-	s.db.Create(&batch)
-	for i := range items {
-		it := model.ArchiveItem{
-			ArchiveBatchID: batch.ID, BackupID: items[i].BackupID,
-			TransferStatus: model.TransferPending,
-		}
-		s.db.Create(&it)
-		items[i].ArchiveItemID = it.ID
-	}
-	if s.ArchiveNotifier != nil {
+	} else if s.ArchiveNotifier != nil {
 		cands := make([]notify.ArchiveCandidate, 0, len(items))
 		for _, it := range items {
 			cands = append(cands, notify.ArchiveCandidate{
@@ -1010,12 +1168,27 @@ func (s *Service) GenerateRollingList(cutoff time.Time) (string, []ArchiveItemFl
 				GFSPath: it.GFSPath, FileSizeBytes: it.FileSizeBytes,
 			})
 		}
-		// 清单下发走 HTTP：推给大数据组件自治拉取→写HDFS→回调结果
-		if err := s.ArchiveNotifier.NotifyArchive(batch.ID, cands); err != nil {
+		if err := s.ArchiveNotifier.NotifyArchive(batchID, cands); err != nil {
+			s.failBatch(batchID, items)
 			return "", nil, fmt.Errorf("归档清单推送失败: %w", err)
 		}
 	}
-	return batch.ID, items, nil
+	s.db.Model(&model.ArchiveBatch{}).Where("id = ?", batchID).Update("status", "PUSHED")
+	return batchID, items, nil
+}
+
+// failBatch 归档清单推送失败后的状态恢复：批次置 FAILED，批次内仍为 ARCHIVING 的
+// 备份经状态机置 ARCHIVE_FAILED（ARCHIVING→ARCHIVE_FAILED 合法），下轮扫描复位后重试。
+func (s *Service) failBatch(batchID string, items []ArchiveItemFlat) {
+	s.db.Model(&model.ArchiveBatch{}).Where("id = ?", batchID).Update("status", "FAILED")
+	for _, it := range items {
+		var m model.BackupMeta
+		if s.db.First(&m, it.BackupID).Error == nil && m.ArchiveStatus == model.StatusArchiving {
+			if e := state.OnArchiveResult(&m, false); e == nil {
+				s.db.Save(&m)
+			}
+		}
+	}
 }
 
 // ArchiveResult 归档结果上报（对应 POST /api/v1/archive/result）。
@@ -1050,7 +1223,19 @@ func (s *Service) ArchiveResult(archiveItemID uint, hdfsPath string, hdfsSizeByt
 	}
 
 	s.db.Save(&item)
-	return s.db.Save(&meta).Error
+	if err := s.db.Save(&meta).Error; err != nil {
+		return err
+	}
+	// 留痕：链路B HDFS 归档 size 校验 + 归档结果流水
+	verifyResult := "FAILED"
+	if sizeValid {
+		verifyResult = "VERIFIED"
+	}
+	s.logVerify(meta.ID, "ARCHIVE", mainVolOf(meta.BackupEdition), "ARCHIVE_SIZE",
+		meta.FileSizeBytes, hdfsSizeBytes, verifyResult)
+	s.audit("ARCHIVE", meta.ID, fmt.Sprintf("%s hdfsSize=%d %s",
+		meta.ArchiveStatus, hdfsSizeBytes, verifyResult))
+	return nil
 }
 
 // QueryArchiveStatus 归档状态查询（对应 GET /api/v1/backup/archive-status）。用于 GFS 清理判定。
@@ -1113,14 +1298,46 @@ func (s *Service) Cleanup() (int, error) {
 			// 真正的删除由外部 GFS 组件按归档状态(/archive-status canDelete)自查执行。
 			continue
 		}
-		s.volStore(&cl, mainVolOf(m.BackupEdition)).Delete(m.GFSPath)
-		s.volStore(&cl, peerVolOf(m.BackupEdition)).Delete(m.PeerGFSPath)
+		// 双卷删除都成功才记账；任一失败不写 DeletedAt，留待下次清理重试
+		if err := s.volStore(&cl, mainVolOf(m.BackupEdition)).Delete(m.GFSPath); err != nil {
+			continue
+		}
+		if err := s.volStore(&cl, peerVolOf(m.BackupEdition)).Delete(m.PeerGFSPath); err != nil {
+			continue
+		}
 		m.DeletedAt = &now
 		m.CanDelete = false
 		s.db.Save(&m)
+		s.audit("CLEAN", m.ID, fmt.Sprintf("gfs=%s peer=%s", m.GFSPath, m.PeerGFSPath))
 		deleted++
 	}
 	return deleted, nil
+}
+
+// archiveStuckAfter 归档卡死判定阈值：超过此时长未收到大数据结果视为回调丢失。
+const archiveStuckAfter = 6 * time.Hour
+
+// SweepArchive 归档超时兜底：ARCHIVING 超过 archiveStuckAfter 仍未收到大数据结果
+// （大数据组件挂了、回调丢失）才置 ARCHIVE_FAILED；之后由下轮滚动清单直接重新纳入。
+// 失败重试不经此处，避免与仍在正常进行的慢拉取赛跑。
+func (s *Service) SweepArchive() (timedOut int, err error) {
+	cutoff := time.Now().Add(-archiveStuckAfter)
+	var hanging []model.BackupMeta
+	if err = s.db.Where("archive_status = ? AND updated_at < ?", model.StatusArchiving, cutoff).
+		Find(&hanging).Error; err != nil {
+		return 0, err
+	}
+	for i := range hanging {
+		m := &hanging[i]
+		if e := state.OnArchiveResult(m, false); e != nil { // ARCHIVING -> ARCHIVE_FAILED
+			continue
+		}
+		if e := s.db.Save(m).Error; e == nil {
+			s.audit("SWEEP", m.ID, "ARCHIVING -> ARCHIVE_FAILED")
+			timedOut++
+		}
+	}
+	return timedOut, nil
 }
 
 // validIP 校验 IPv4/IPv6 地址格式。

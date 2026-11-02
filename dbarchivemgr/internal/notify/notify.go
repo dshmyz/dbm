@@ -64,10 +64,21 @@ type HTTPReplenishNotifier struct {
 	log    *log.Logger
 }
 
-// NewHTTP 构造打大数据组件 /v1/replenish/notify 的推送实现。
+// DefaultTimeout 出站 HTTP 默认超时。
+const DefaultTimeout = 30 * time.Second
+
+// NewHTTP 构造打大数据组件 /v1/replenish/notify 的推送实现（默认超时）。
 func NewHTTP(base string) *HTTPReplenishNotifier {
+	return NewHTTPTimeout(base, DefaultTimeout)
+}
+
+// NewHTTPTimeout 携带指定超时；timeout<=0 回落默认。
+func NewHTTPTimeout(base string, timeout time.Duration) *HTTPReplenishNotifier {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
 	return &HTTPReplenishNotifier{
-		Client: http.DefaultClient, Base: base,
+		Client: &http.Client{Timeout: timeout}, Base: base,
 		log: log.New(log.Writer(), "[HTTP 管控→大数据] ", log.LstdFlags),
 	}
 }
@@ -113,10 +124,18 @@ type HTTPArchiveNotifier struct {
 	log    *log.Logger
 }
 
-// NewHTTPArchive 构造打大数据组件 /v1/archive/notify 的推送实现。
+// NewHTTPArchive 构造打大数据组件 /v1/archive/notify 的推送实现（默认超时）。
 func NewHTTPArchive(base string) *HTTPArchiveNotifier {
+	return NewHTTPArchiveTimeout(base, DefaultTimeout)
+}
+
+// NewHTTPArchiveTimeout 携带指定超时；timeout<=0 回落默认。
+func NewHTTPArchiveTimeout(base string, timeout time.Duration) *HTTPArchiveNotifier {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
 	return &HTTPArchiveNotifier{
-		Client: http.DefaultClient, Base: base,
+		Client: &http.Client{Timeout: timeout}, Base: base,
 		log: log.New(log.Writer(), "[HTTP 管控→大数据] ", log.LstdFlags),
 	}
 }

@@ -34,6 +34,7 @@ func New(dsn string) (*gorm.DB, error) {
 		&model.Inspect{},
 		&model.InspectMissing{},
 		&model.FileVerifyLog{},
+		&model.AuditLog{},
 		&model.GfsEndpoint{},
 	); err != nil {
 		return nil, fmt.Errorf("元数据建表失败: %w", err)

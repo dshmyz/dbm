@@ -226,3 +226,45 @@ func TestCASInvalidTicket(t *testing.T) {
 		t.Fatalf("非法 ticket 应 401, got %d", res.StatusCode)
 	}
 }
+
+// TestMachineToken 验证机器回调密钥：未配置时放行；配置后无令牌/错令牌 401，正确令牌放行。
+func TestMachineToken(t *testing.T) {
+	// 重建路由以注入 MachineToken
+	gin.SetMode(gin.TestMode)
+	db, _ := store.New(":memory:")
+	svc := service.New(db, &gfsclient.MemFileStore{GFS: sim.NewGFS("/gfs")})
+	router := gin.New()
+	mw := New("http://cas.example/cas", "/p3/proxyValidate", "")
+	mw.MachineToken = "secret-123"
+	mw.Register(router)
+	router.Use(mw.Require())
+	(&api.Handler{Svc: svc, DB: db}).Register(router)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	call := func(token string) int {
+		req, _ := http.NewRequest("POST", srv.URL+"/api/v1/archive/result", strings.NewReader("{}"))
+		if token != "" {
+			req.Header.Set("X-Machine-Token", token)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		return r.StatusCode
+	}
+
+	// 无令牌 → 401
+	if st := call(""); st != http.StatusUnauthorized {
+		t.Errorf("配置密钥后无令牌应 401, got %d", st)
+	}
+	// 错令牌 → 401
+	if st := call("wrong"); st != http.StatusUnauthorized {
+		t.Errorf("错令牌应 401, got %d", st)
+	}
+	// 正确令牌 → 放行（非 401；业务层因空 body 返回别的码）
+	if st := call("secret-123"); st == http.StatusUnauthorized {
+		t.Errorf("正确令牌应放行, got %d", st)
+	}
+}

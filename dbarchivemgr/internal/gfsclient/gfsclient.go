@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"time"
 
 	"github.com/dbarchivemgr/dbarchivemgr/internal/sim"
 )
@@ -24,8 +25,8 @@ type FileStore interface {
 	Stat(path string) (exists bool, size int64)
 	// Exists 判定文件存在且非空（存在+size>阈值，对应上传/巡检判定口径）。
 	Exists(path string) bool
-	// Delete 从 GFS 删除文件（清理已满足留存条件的已归档备份）。
-	Delete(path string)
+	// Delete 从 GFS 删除文件（清理已满足留存条件的已归档备份）。失败返回 error。
+	Delete(path string) error
 }
 
 // statResp GFS 组件 /v1/fs/stat 的响应体。
@@ -36,15 +37,25 @@ type statResp struct {
 
 // HTTPFileStore 管控对 GFS 组件的 HTTP 客户端实现（真实现）。
 type HTTPFileStore struct {
-	Client *http.Client
-	Base   string // GFS 组件服务地址，如 http://127.0.0.1:8091
-	log    *log.Logger
+	Client  *http.Client
+	Base    string        // GFS 组件服务地址，如 http://127.0.0.1:8091
+	Timeout time.Duration // 出站超时（供 notify 按同机房复用）
+	log     *log.Logger
 }
 
-// NewHTTP 构造打 GFS 组件 HTTP 接口的 FileStore。
-func NewHTTP(base string) *HTTPFileStore {
+// DefaultTimeout 出站 HTTP 默认超时。
+const DefaultTimeout = 30 * time.Second
+
+// NewHTTP 构造打 GFS 组件 HTTP 接口的 FileStore（默认超时）。
+func NewHTTP(base string) *HTTPFileStore { return NewHTTPTimeout(base, DefaultTimeout) }
+
+// NewHTTPTimeout 构造携带指定超时的 FileStore；timeout<=0 回落默认。
+func NewHTTPTimeout(base string, timeout time.Duration) *HTTPFileStore {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
 	return &HTTPFileStore{
-		Client: http.DefaultClient, Base: base,
+		Client: &http.Client{Timeout: timeout}, Base: base, Timeout: timeout,
 		log: log.New(log.Writer(), "[HTTP 管控→GFS] ", log.LstdFlags),
 	}
 }
@@ -73,24 +84,27 @@ func (h *HTTPFileStore) Exists(path string) bool {
 	return exists && size > sim.MinFileSize
 }
 
-// Delete 打 DELETE /v1/fs/delete ，body 携带 {path}。
-func (h *HTTPFileStore) Delete(path string) {
+// Delete 打 DELETE /v1/fs/delete ，body 携带 {path}；请求失败或非 2xx 返回 error。
+func (h *HTTPFileStore) Delete(path string) error {
 	body, _ := json.Marshal(struct {
 		Path string `json:"path"`
 	}{path})
 	req, err := http.NewRequest(http.MethodDelete, h.Base+"/v1/fs/delete", bytes.NewReader(body))
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := h.Client.Do(req)
 	if err != nil {
-		h.log.Printf("delete %s -> err=%v", path, err)
-		return
+		return err
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("delete 返回 status=%d", resp.StatusCode)
+	}
 	h.log.Printf("delete %s -> done", path)
+	return nil
 }
 
 // RegionSource 按机房(region)名取对应 GFS 访问面的抽象（多机房部署用）。
@@ -150,12 +164,16 @@ func (r *RegionRouter) For(region string) FileStore {
 	return missingStore{}
 }
 
+// NewMissing 构造"无兜底"空访问面：一切文件视为不存在（与 HTTP 出错同语义：
+// stat 视为缺失、照常进补发流程，不 panic）。用于机房未匹配且无兜底端点时。
+func NewMissing() FileStore { return missingStore{} }
+
 // missingStore 未匹配机房且无兜底时的空实现：一切文件视为不存在。
 type missingStore struct{}
 
 func (missingStore) Stat(string) (bool, int64) { return false, 0 }
 func (missingStore) Exists(string) bool        { return false }
-func (missingStore) Delete(string)             {}
+func (missingStore) Delete(string) error       { return nil }
 
 // sortedKeys 返回 map 键的字典序（小工具，避免引入 slices 包依赖差异）。
 func sortedKeys(m map[string]string) []string {
@@ -183,4 +201,7 @@ func (m *MemFileStore) Stat(path string) (bool, int64) {
 func (m *MemFileStore) Exists(path string) bool { return m.GFS.Exists(path) }
 
 // Delete 委托 sim.GFS.Delete。
-func (m *MemFileStore) Delete(path string) { m.GFS.Delete(path) }
+func (m *MemFileStore) Delete(path string) error {
+	m.GFS.Delete(path)
+	return nil
+}

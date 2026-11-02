@@ -162,79 +162,70 @@ instance,CL-AT-01,,,,,,,,,,,10.20.30.41,db-orders-01,MASTER
 
 > 后台「集群拓扑」页顶部可**单条新增集群**、**下载 CSV 模板**、**导入 CSV**；集群卡片右上角可**编辑/删除**集群，并按「+ 库」「+ 实例」单条新增库与实例 IP（删除均二次确认；删除集群级联删库+实例，但保留备份元数据与归档历史）。
 
-### 定时调度启动参数
+### 定时调度
 
-```bash
-# 生产模式：每日凌晨触发（巡检 3:00 / 滚动清单 2:00）
-go run ./cmd/server -schedule-demo=false
+定时作业的 cron 规格与巡检天数为包内常量，**无需配置**：
 
-# 演示模式（默认）：秒级触发便于观察（巡检 15s / 滚动 30s）
-go run ./cmd/server
+| 作业 | 生产（`-schedule-demo=false`） | 演示（默认） |
+|---|---|---|
+| 归档超时扫描 | 每日 1:00 | — |
+| 滚动归档清单 | 每日 2:00 | 每 30s |
+| 完整性巡检+补发 | 每日 3:00 | 每 15s |
 
-# 显式指定 cron 规格（覆盖默认）：
-go run ./cmd/server -schedule-spec "@every 10s" -rolling-spec "0 0 2 * * *"
-```
-
-调度器默认 `-window-days 15`，与种子数据对齐；`GET /api/v1/schedule/status` 可查看各任务最近运行时间与结果。
+巡检扫描近 30 天（常量 `inspectHorizonDays`，≥ 各库归档窗口）；`GET /api/v1/schedule/status` 可查看各任务最近运行时间与结果。
 
 ### 组件地址可配置（线上连真实 GFS 管理端）
 
-管控出站只对接 **GFS 管理端**一处（stat/delete + 归档清单转发 + 补发指令，DB 代理监听同在管理端）；**不直连大数据**（归档结果由大数据回调进来）。线上部署时把地址用**启动参数**（或同名环境变量）指到真实服务，或直接在管理后台「机房管理」页配置，**无需改代码**。
+管控出站只对接 **GFS 管理端**一处（stat/delete + 归档清单转发 + 补发指令，DB 代理监听同在管理端）；**不直连大数据**（归档结果由大数据回调进来）。
 
-| 参数 | 环境变量 | 说明 | 缺省 |
+**GFS 地址不走启动参数**：在管理后台「机房管理」页配置（机房名填 `*` 即单地址模式），或用环境变量 `DBAM_GFS_MAP`；两者皆不配则起内置桩（纯演示）。
+
+| 启动参数 | 环境变量 | 说明 | 缺省 |
 |---|---|---|---|
-| `-gfs-url` | `DBAM_GFS_URL` | **GFS 管理端地址**（stat/delete + 归档清单转发 + 补发指令，如 http://gfs:8200） | 内置桩 |
-| `-gfs-map` | `DBAM_GFS_MAP` | **多机房 GFS 映射**：机房→管理端地址（JSON 内联或 `@file`），按集群 cityRegion/drRegion 分发；推荐在界面「机房管理」配置 | 未配置=单地址模式 |
 | `-public-url` | `DBAM_PUBLIC_URL` | 管控对外地址，供大数据组件回调 `/archive/result` | 取监听地址 `-addr` |
-| `-cleanup-mode` | `DBAM_CLEANUP_MODE` | 清理触发方：`mgr`=管控经 HTTP 触发删除（默认/现状）；`gfs`=管控仅放行判定、GFS 自治清理（原始设想） | `mgr` |
-| `-cas-url` | `DBAM_CAS_URL` | CAS 服务根地址（如 `https://cas.example.com/cas`）；**空=演示模式不鉴权** | 空（演示模式） |
-| `-cas-validate-path` | `DBAM_CAS_VALIDATE_PATH` | CAS ticket 校验路径（CAS 3.x: `/p3/proxyValidate`；CAS 2.x 服务端可用 `/serviceValidate`） | `/p3/proxyValidate` |
+| `-cas-url` | `DBAM_CAS_URL` | CAS 服务根地址（如 https://cas.example.com/cas）；**空=演示模式不鉴权** | 空（演示模式） |
+| — | `DBAM_GFS_MAP` | **GFS 管理端地址**：机房→管理端映射（JSON 内联或 `@file`），`"*"` 键为兜底/单地址；推荐在界面「机房管理」配置 | 未配置=内置桩 |
+| — | `DBAM_CLEANUP_MODE` | 清理触发方：`gfs`=GFS 自治清理（**默认**，删前自查 canDelete）；`mgr`=管控触发删除（应急） | `gfs` |
+| — | `DBAM_CAS_VALIDATE_PATH` | CAS ticket 校验路径（CAS 2.x 服务端用 `/serviceValidate`） | `/p3/proxyValidate` |
+| — | `DBAM_MACHINE_TOKEN` | 机器回调共享密钥（密钥不上命令行） | 空=不校验（演示） |
 
-> 优先级：界面「机房管理」库表 **>** `-gfs-url`/`-gfs-map` 静态映射 **>** 内置桩（全都不配则纯演示）。出站统一指向 GFS 管理端，无其他地址参数。
+> 优先级：界面「机房管理」库表 **>** `DBAM_GFS_MAP` 静态映射 **>** 内置桩（全都不配则纯演示）。出站统一指向 GFS 管理端，无其他地址参数。
 > 管控**不做任何 HDFS 操作、不直连大数据**：HDFS 完全归大数据组件内部自有；归档清单与补发指令都发 GFS 管理端，由其转发大数据/DB 代理。
 
-### 多机房 GFS：按机房映射多个管理端（界面配置 / `-gfs-map`）
+### 多机房 GFS：按机房映射多个管理端（界面配置 / DBAM_GFS_MAP）
 
 各机房独立部署 GlusterFS 集群（同城卷在 A 机房、异地卷在 B 机房，或更多）且无统一网关时，管控可配置**机房→GFS 管理端**映射，把 stat/delete 按集群的 `cityRegion`（同城卷）/`drRegion`（异地卷）分发到对应机房的管理端。
 
-**推荐在管理后台「机房管理」页配置**（存库表 `tb_gfs_endpoint`，增删改即时生效，30s 缓存/写后失效）；启动参数 `-gfs-map` 作为免界面的引导/兜底方式：
+**推荐在管理后台「机房管理」页配置**（存库表 `tb_gfs_endpoint`，增删改即时生效，30s 缓存/写后失效）；免界面时用环境变量 `DBAM_GFS_MAP` 引导/兜底：
 
 ```bash
-# 内联 JSON（"*" 键为未匹配机房的兜底管理端）
-go run ./cmd/server \
-  -gfs-map '{"杭州同城":"http://gfs-hz:8200","乌兰察布":"http://gfs-wlc:8210","*":"http://gfs:8200"}'
+# 内联 JSON（"*" 键为未匹配机房的兜底管理端；只配一条 "*" 即单地址模式）
+DBAM_GFS_MAP='{"杭州同城":"http://gfs-hz:8200","乌兰察布":"http://gfs-wlc:8210","*":"http://gfs:8200"}' go run ./cmd/server
 
-# 或指向映射文件；兜底也可用 -gfs-url 给出
-DBAM_GFS_MAP=@/etc/dbam/gfs-map.json go run ./cmd/server -gfs-url http://gfs:8200
+# 或指向映射文件
+DBAM_GFS_MAP=@/etc/dbam/gfs-map.json go run ./cmd/server
 ```
 
-- **配置优先级**：库表 `tb_gfs_endpoint`（界面「机房管理」）**>** `-gfs-map`/`-gfs-url` 静态映射 **>** 单地址；库表为空时回落启动参数，两者皆无则全走单地址。
+- **配置优先级**：库表 `tb_gfs_endpoint`（界面「机房管理」）**>** `DBAM_GFS_MAP` 静态映射；两者皆无则内置桩演示。
 - **分发规则**：备份主卷按版本推卷——同城备(SAME_CITY)主卷=city→查 `cityRegion`，异地备(DR)主卷=dr→查 `drRegion`；对卷取另一卷的 region。上报双卷复核、巡检、补发定位、清理删除、归档清单取数均按此分发。
-- **未匹配机房**（region 未配/为空）回落兜底管理端：`*` 端点 > `-gfs-url` > 映射中字典序首个机房；无任何兜底时视为文件不存在（照常进补发流程，不 panic）。
+- **未匹配机房**（region 未配/为空）回落兜底管理端：`*` 端点 > 映射中字典序首个机房；无任何兜底时视为文件不存在（照常进补发流程，不 panic）。
 - 配置映射即进入外部 GFS 模式（不再注入演示种子数据）；判定语义不变——双卷各自 stat、任一机房不达标即上报失败/进缺失清单。
 
-### 清理触发方可配置（原始设想 vs 现状）
+### 清理触发方（GFS 自治为默认，mgr 仅应急）
 
-原始方案设想「GFS 自治清理」（GFS 每日自己删、删前查管控归档状态）；当前实现为「管控触发清理」（管控遍历已归档、满留存的备份，经 HTTP 让 GFS 删）。两者通过 `-cleanup-mode` 切换：
+按最终设计，**清理归 GFS 自治**（GFS 每日自己删、删前查管控归档状态）；`mgr` 模式（管控经 HTTP 主动删）仅保留作应急。通过环境变量 `DBAM_CLEANUP_MODE` 切换：
 
-- **`mgr`（默认/现状）**：`POST /api/v1/cleanup` 执行时，管控对每份「已归档 + 满该集群留存天数」的备份调用 `DELETE /v1/fs/delete` 让 GFS 删文件。
-- **`gfs`（原始设想）**：`POST /api/v1/cleanup` 只做**放行判定**（返回清点结果），**不实际删除** GFS 文件；真正的删除由外部 GFS 组件自治执行——GFS 删前经 `GET /api/v1/backup/archive-status` 的 `canDelete/pendingDeleteAt` 判定满留存，满足才删。
+- **`gfs`（默认）**：管控只提供**放行判定**——`GET /api/v1/backup/archive-status` 返回 `canDelete/pendingDeleteAt`（已归档且满该集群留存天数）；GFS 删前自查该接口，满足才删。
+- **`mgr`（应急）**：`POST /api/v1/cleanup` 执行时，管控对每份「已归档 + 满留存」的备份调用 `DELETE /v1/fs/delete` 让 GFS 删文件。
 
 ```bash
-# GFS 自治清理模式（贴合原始方案）
-go run ./cmd/server -cleanup-mode gfs
-DBAM_CLEANUP_MODE=gfs go run ./cmd/server
+# GFS 自治清理（默认，无需配置）；应急切 mgr：
+DBAM_CLEANUP_MODE=mgr go run ./cmd/server
 ```
 
 ```bash
-# 线上（推荐）：出站统一指向 GFS 管理端，生产每日凌晨调度
-go run ./cmd/server \
-  -schedule-demo=false \
-  -gfs-url  http://gfs-gateway:8200 \
-  -public-url http://dbam:8090
-
-# 等价：全走环境变量（或直接在管理后台「机房管理」页配置）
-DBAM_GFS_URL=http://gfs-gateway:8200 DBAM_PUBLIC_URL=http://dbam:8090 \
+# 线上（推荐）：GFS 地址在管理后台「机房管理」配置（或 DBAM_GFS_MAP），生产每日凌晨调度
+DBAM_GFS_MAP='{"*":"http://gfs-gateway:8200"}' DBAM_PUBLIC_URL=http://dbam:8090 \
   go run ./cmd/server -schedule-demo=false
 
 # 本地/演示：什么都不配，用内置桩（demo.sh 即此模式）
@@ -242,23 +233,21 @@ go run ./cmd/server
 ```
 
 - 生产需配 `-public-url`（或让其暴露的入站地址等于 `-addr`）保证大数据组件能回调到管控。
-- 外部 GFS 模式不注入演示种子数据；仅当 GFS 也为内置桩时才注入（纯演示）。
+- 外部 GFS 模式（配了机房端点）不注入演示种子数据；仅当 GFS 也为内置桩时才注入（纯演示）。
 
 ### 登录鉴权：CAS 单点登录（可演示/生产切换）
 
 管理后台与 REST 接口支持 **CAS 2/3 标准协议单点登录**（浏览器跳 CAS 登录页 → 携 ticket 回调 → 管控调 CAS `/p3/proxyValidate` 校验 → 签发本地会话 Cookie `dbam_session`，12h 有效）：
 
 ```bash
-# 生产：对接真实 CAS
+# 生产：对接真实 CAS（GFS 地址见「组件地址可配置」一节）
 go run ./cmd/server -schedule-demo=false \
-  -gfs-url http://gfs-gateway:8200 \
   -public-url    http://dbam:8090 \
   -cas-url       https://cas.example.com/cas
 
 # CAS 2.x 老服务端（校验路径可换）：
-go run ./cmd/server -cas-url https://cas.example.com/cas -cas-validate-path /serviceValidate
-
-# 环境变量等价：DBAM_CAS_URL / DBAM_CAS_VALIDATE_PATH
+go run ./cmd/server -cas-url https://cas.example.com/cas
+DBAM_CAS_VALIDATE_PATH=/serviceValidate  # 环境变量切换校验路径
 ```
 
 - **保护范围**：`/ui/*` 与 `/api/v1/*` 均要求登录；未登录访问页面 302 跳 CAS，REST 调用返回 `401` JSON。
@@ -286,5 +275,5 @@ go run ./cmd/server -cas-url https://cas.example.com/cas -cas-validate-path /ser
 - `sim.GFS`（文件载体 + 清单转发）→ 已挂载的本地 GlusterFS 管理端；管控经 `gfsclient.HTTPFileStore` 打其 HTTP 接口，不直连目录。
 - `bigdata`（大数据组件）→ 真实大数据归档系统：由 GFS 转发归档清单触发，自治拉取写 HDFS 后回调管控；管控不感知 HDFS。
 - `bigdata` 的 `/v1/replenish/notify`（演示中兼任 DB 代理替身）→ 真实 DB 代理监听接口（部署在 GFS 管理端同址）。
-- 管控出站无其他地址：`-component-url` 已移除，一切指向 GFS 管理端。
+- 管控出站无其他地址，一切指向 GFS 管理端。
 - 元数据 `SQLite` → 生产 MySQL（DDL 见 `../技术方案/DBArchiveManager元数据DDL.sql`）。

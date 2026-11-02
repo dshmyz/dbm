@@ -213,10 +213,20 @@ type FileVerifyLog struct {
 // Region 须与 Cluster.cityRegion（同城卷）/drRegion（异地卷）填写一致；
 // Region="*" 为未匹配机房的兜底管理端。界面/接口可增删改，改动即时生效（短缓存）。
 type GfsEndpoint struct {
-	ID        uint      `gorm:"primaryKey" json:"endpointId"`
-	Region    string    `gorm:"size:64;uniqueIndex" json:"region"`
-	BaseURL   string    `gorm:"size:255" json:"baseUrl"`
-	Remark    string    `gorm:"size:255" json:"remark"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID           uint      `gorm:"primaryKey" json:"endpointId"`
+	Region       string    `gorm:"size:64;uniqueIndex" json:"region"`
+	BaseURL      string    `gorm:"size:255" json:"baseUrl"`
+	TimeoutSec   int       `gorm:"default:30" json:"timeoutSeconds"` // 出站 HTTP 超时(秒)；<=0 用全局默认
+	Remark       string    `gorm:"size:255" json:"remark"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// AuditLog 对应 tb_audit_log：备份/补发/归档/清理/状态变更的操作流水。
+type AuditLog struct {
+	ID        uint   `gorm:"primaryKey" json:"logId"`
+	BackupID  uint   `gorm:"index" json:"backupId"`
+	Action    string `gorm:"size:40;index" json:"action"` // META_REPORT/REPLENISH/ROLLING/ARCHIVE/CLEAN/SWEEP
+	Detail    string `gorm:"type:text" json:"detail"`     // 动作详情（前后状态等）
+	CreatedAt time.Time
 }

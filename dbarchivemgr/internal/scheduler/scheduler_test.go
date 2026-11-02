@@ -50,7 +50,7 @@ func seedWithDB(t *testing.T, db *gorm.DB) *service.Service {
 func TestInspectReplenish(t *testing.T) {
 	db, _ := store.New(":memory:")
 	svc := seedWithDB(t, db)
-	s := New(svc, db, 15, "@every 30s", "@every 30s")
+	s := New(svc, db, true)
 	s.runInspectAndReplenish()
 
 	snap := s.Snapshot()
@@ -73,7 +73,7 @@ func TestInspectReplenish(t *testing.T) {
 func TestRollingList(t *testing.T) {
 	db, _ := store.New(":memory:")
 	svc := seedWithDB(t, db)
-	s := New(svc, db, 1, "", "@every 30s") // window=1 → 仅 1 天前备份过窗
+	s := New(svc, db, true)
 	s.runRollingList()
 
 	snap := s.Snapshot()

@@ -81,30 +81,32 @@ func OnRollingSubmit(meta *model.BackupMeta) error {
 	return nil
 }
 
-// OnArchiveResult 归档结果上报。
-// 判定采用「存在 + size 校验」（不做 MD5）：sizeValid=true 则置 ARCHIVED，否则置 ARCHIVE_FAILED。
+// OnArchiveResult 大数据归档结果回调。
+// sizeValid=true（拉取成功、校验通过）：信任实际结果，从 NOT_ARCHIVED/ARCHIVE_FAILED
+// 经 ARCHIVING 收敛到 ARCHIVED；ARCHIVED 幂等。避免「判超时后大数据其实成功、结果却被拒」。
+// sizeValid=false：置 ARCHIVE_FAILED。
 func OnArchiveResult(meta *model.BackupMeta, sizeValid bool) error {
-	sm := NewArchiveStateMachine(meta.ArchiveStatus)
-	target := model.StatusArchiveFailed
 	if sizeValid {
-		target = model.StatusArchived
+		sm := NewArchiveStateMachine(meta.ArchiveStatus)
+		if meta.ArchiveStatus != model.StatusArchiving && meta.ArchiveStatus != model.StatusArchived {
+			s, err := sm.Transition(model.StatusArchiving)
+			if err != nil {
+				return err
+			}
+			meta.ArchiveStatus = s
+		}
+		if meta.ArchiveStatus == model.StatusArchived {
+			return nil // 幂等
+		}
+		s, err := sm.Transition(model.StatusArchived)
+		if err != nil {
+			return err
+		}
+		meta.ArchiveStatus = s
+		return nil
 	}
-	s, err := sm.Transition(target)
-	if err != nil {
-		return err
-	}
-	meta.ArchiveStatus = s
-	return nil
-}
-
-// OnRetry 失败重试：ARCHIVE_FAILED -> ARCHIVING；或回退 NOT_ARCHIVED 下轮窗口。
-func OnRetry(meta *model.BackupMeta) error {
 	sm := NewArchiveStateMachine(meta.ArchiveStatus)
-	target := model.StatusArchiving
-	if !sm.Can(target) {
-		target = model.StatusNotArchived
-	}
-	s, err := sm.Transition(target)
+	s, err := sm.Transition(model.StatusArchiveFailed)
 	if err != nil {
 		return err
 	}

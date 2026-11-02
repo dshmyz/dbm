@@ -309,11 +309,12 @@ const ACTIONS = {
     await openEditor("新增机房 GFS 管理端", [
       { key: "region", label: "机房名（须与集群 同城备卷/异地备卷 填写一致；* 为兜底）", value: "" },
       { key: "baseUrl", label: "GFS 管理端地址（必填）", value: "", ph: "http://gfs-hz:8200" },
+      { key: "timeoutSeconds", label: "出站超时（秒，留空/0=默认30s）", value: "", type: "number", ph: "30" },
       { key: "remark", label: "备注", value: "" },
     ], async (f) => {
       if (!f.region || !f.baseUrl) throw new Error("机房名与管理端地址必填");
       await api("/gfs/endpoints", { method: "POST", body: JSON.stringify({
-        region: f.region, baseUrl: f.baseUrl, remark: f.remark || null,
+        region: f.region, baseUrl: f.baseUrl, timeoutSeconds: Number(f.timeoutSeconds) || 0, remark: f.remark || null,
       }) });
       toast(`机房端点已新增：${f.region} → ${f.baseUrl}（即时生效）`, "ok");
       await loadTab();
@@ -328,11 +329,12 @@ const ACTIONS = {
     await openEditor(`编辑机房 ${e.region}`, [
       { key: "region", label: "机房名（* 为兜底）", value: e.region },
       { key: "baseUrl", label: "GFS 管理端地址", value: e.baseUrl },
+      { key: "timeoutSeconds", label: "出站超时（秒，留空/0=默认30s）", value: e.timeoutSeconds || "", type: "number", ph: "30" },
       { key: "remark", label: "备注", value: e.remark || "" },
     ], async (f) => {
       if (!f.region || !f.baseUrl) throw new Error("机房名与管理端地址必填");
       await api(`/gfs/endpoints/${id}`, { method: "PUT", body: JSON.stringify({
-        region: f.region, baseUrl: f.baseUrl, remark: f.remark || null,
+        region: f.region, baseUrl: f.baseUrl, timeoutSeconds: Number(f.timeoutSeconds) || 0, remark: f.remark || null,
       }) });
       toast("机房端点已更新（即时生效）", "ok");
       await loadTab();
@@ -341,7 +343,7 @@ const ACTIONS = {
 
   "gfs-endpoint-del": (btn) => new Promise((resolve) => {
     confirmBox(`删除机房「${btn.dataset.name}」的管理端配置？`,
-      "删除后该机房的 stat/delete 回落兜底端点（* 或 -gfs-url）；未配置任何兜底时按文件不存在处理。",
+      "删除后该机房的 stat/delete 回落兜底端点（* 或 DBAM_GFS_MAP 兜底）；未配置任何兜底时按文件不存在处理。",
       async () => {
         try { await api(`/gfs/endpoints/${btn.dataset.id}`, { method: "DELETE" }); toast("机房端点已删除", "ok"); }
         catch (e) { toast(`删除失败：${e.message}`, "err"); }
@@ -600,6 +602,7 @@ async function renderGfs(content) {
       <td class="num">${e.endpointId}</td>
       <td>${esc(e.region)}</td>
       <td class="path">${esc(e.baseUrl)}</td>
+      <td class="num">${e.timeoutSeconds || 30}s</td>
       <td>${esc(e.remark || "-")}</td>
       <td>${usedBy[e.region] ? `${usedBy[e.region]} 个集群` : '<span class="hint">未被集群引用</span>'}</td>
       <td class="ops">
@@ -618,9 +621,9 @@ async function renderGfs(content) {
       </div>
       ${list.length ? `
       <table class="tbl">
-        <thead><tr><th>ID</th><th>机房</th><th>GFS 管理端地址</th><th>备注</th><th>引用</th></tr></thead>
+        <thead><tr><th>ID</th><th>机房</th><th>GFS 管理端地址</th><th>超时</th><th>备注</th><th>引用</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>` : `<div class="empty-tip">尚未配置机房端点：当前为单地址模式（全部 stat/delete 打 -gfs-url / -component-url 或内置桩）。
+      </table>` : `<div class="empty-tip">尚未配置机房端点：当前未配置 GFS 管理端。新增「机房→管理端」后（机房名填 * 即单地址模式），stat/delete 与归档/补发通知即按机房路由。
         在此新增「机房→GFS 管理端」后，管控将按集群的 cityRegion/drRegion 分发双卷的 stat/delete。</div>`}
     </div>`;
 }

@@ -21,13 +21,23 @@ type LastRun struct {
 	LastOK    bool       `json:"lastOK"`
 }
 
+// 定时作业规格（包内常量，无需配置）。
+// 扫描排在滚窗之前：超时置失败后，当天滚窗即可重试。
+const (
+	inspectProdSpec    = "0 0 3 * * *"  // 巡检+补发: 生产每日3点
+	inspectDemoSpec    = "@every 15s"   // 演示15s
+	rollingProdSpec    = "0 0 2 * * *"  // 滚动清单: 生产每日2点
+	rollingDemoSpec    = "@every 30s"   // 演示30s
+	sweepSpec          = "0 0 1 * * *"  // 归档超时扫描: 生产每日1点
+	inspectHorizonDays = 30             // 巡检扫描天数(≥归档窗口, 见 DDL 口径说明)
+)
+
 // Scheduler 编排日常定时作业。
 type Scheduler struct {
 	svc *service.Service
 	db  *gorm.DB
 	log *log.Logger
 
-	windowDays  int
 	inspectSpec string
 	rollingSpec string
 
@@ -35,11 +45,16 @@ type Scheduler struct {
 	last map[string]LastRun
 }
 
-// New 构造调度器。windowDays 为巡检与滚窗共用的归档窗口天数。
-func New(svc *service.Service, db *gorm.DB, windowDays int, inspectSpec, rollingSpec string) *Scheduler {
+// New 构造调度器。demo=true 用秒级演示节奏，false 用每日凌晨生产节奏。
+// GFS 清理由 GFS 自治（删前自查 canDelete 状态接口），管控不挂清理作业。
+func New(svc *service.Service, db *gorm.DB, demo bool) *Scheduler {
+	is, rs := inspectProdSpec, rollingProdSpec
+	if demo {
+		is, rs = inspectDemoSpec, rollingDemoSpec
+	}
 	return &Scheduler{
 		svc: svc, db: db, log: log.New(log.Writer(), "[sched] ", log.LstdFlags),
-		windowDays: windowDays, inspectSpec: inspectSpec, rollingSpec: rollingSpec,
+		inspectSpec: is, rollingSpec: rs,
 		last: make(map[string]LastRun),
 	}
 }
@@ -52,7 +67,12 @@ func (s *Scheduler) Start(c *cron.Cron) error {
 	if _, err := c.AddFunc(s.rollingSpec, s.runRollingList); err != nil {
 		return err
 	}
+	if _, err := c.AddFunc(sweepSpec, s.runSweepArchive); err != nil {
+		return err
+	}
 	c.Start()
+	s.log.Printf("定时作业已启动: 巡检=%s 滚动=%s 超时扫描=%s(巡检天数=%d)",
+		s.inspectSpec, s.rollingSpec, sweepSpec, inspectHorizonDays)
 	return nil
 }
 
@@ -78,7 +98,7 @@ func (s *Scheduler) Snapshot() map[string]LastRun {
 // runInspectAndReplenish 每日完整性巡检 + 缺失自动下发补发。
 // 巡检（RunInspect）产出缺失明细；逐条 CreateReplenishTask 下发补发（已有防抖，重复幂等）。
 func (s *Scheduler) runInspectAndReplenish() {
-	res, err := s.svc.RunInspect(time.Now(), s.windowDays)
+	res, err := s.svc.RunInspect(time.Now(), inspectHorizonDays)
 	if err != nil {
 		s.log.Printf("巡检失败: %v", err)
 		s.record("inspect", s.inspectSpec, -1, false)
@@ -108,4 +128,18 @@ func (s *Scheduler) runRollingList() {
 	}
 	s.log.Printf("滚动清单生成 batch=%s items=%d", batchID, len(items))
 	s.record("rolling", s.rollingSpec, len(items), true)
+}
+
+// runSweepArchive 归档超时兜底：卡死/回调丢失的归档置失败，下轮清单直接重试。
+func (s *Scheduler) runSweepArchive() {
+	timedOut, err := s.svc.SweepArchive()
+	if err != nil {
+		s.log.Printf("归档扫描失败: %v", err)
+		s.record("sweep", sweepSpec, -1, false)
+		return
+	}
+	if timedOut > 0 {
+		s.log.Printf("归档扫描: 超时标记=%d", timedOut)
+	}
+	s.record("sweep", sweepSpec, timedOut, true)
 }

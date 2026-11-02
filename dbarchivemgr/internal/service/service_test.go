@@ -1,13 +1,18 @@
 package service
 
 import (
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dbarchivemgr/dbarchivemgr/internal/gfsclient"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/model"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/sim"
+	"github.com/dbarchivemgr/dbarchivemgr/internal/state"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/store"
 )
 
@@ -442,5 +447,220 @@ func TestDBRegionEndpoints(t *testing.T) {
 	}
 	if fs := svc.regionSource().For("不存在的机房"); fs != nil {
 		t.Fatalf("无兜底时未匹配机房应回落 nil, got %T", fs)
+	}
+}
+
+// rollingOne 上报昨日备份→滚窗纳入（ARCHIVING，不回调结果），返回 svc 与该 meta。
+func rollingOne(t *testing.T) (*Service, model.BackupMeta) {
+	t.Helper()
+	gfs := sim.NewGFS("/gfs")
+	db, _ := store.New(":memory:")
+	svc := New(db, &gfsclient.MemFileStore{GFS: gfs})
+	now := time.Now()
+	cl, _ := svc.RegisterCluster(&model.Cluster{ClusterCode: "CL", RetentionDays: model.IntPtr(0)})
+	svc.AddClusterInstance(cl.ID, "10.0.0.9", "a", "MASTER")
+	svc.BindDB(&model.DB{ClusterID: cl.ID, DBName: "dbX", ArchiveWindowDays: 1})
+	seedDay(t, svc, gfs, "10.0.0.9", "dbX", 1, now)
+	_, items, _ := svc.GenerateRollingList(now)
+	var meta model.BackupMeta
+	svc.db.First(&meta, items[0].BackupID)
+	return svc, meta
+}
+
+// TestTerminalLock 验证重复上报不得冲破 ARCHIVED 终态：状态与路径均不被覆盖。
+func TestTerminalLock(t *testing.T) {
+	now := time.Now()
+	svc, metaID := archiveOne(t, model.IntPtr(0)) // ARCHIVED
+
+	fakeCity := "/gfs/10.0.0.9/dbX/fake/city/full.sql.gz"
+	fakeDr := "/gfs/10.0.0.9/dbX/fake/dr/full.sql.gz"
+	// 文件并不存在；终态锁定应在文件校验前直接幂等返回
+	got, err := svc.ReportBackupMeta("10.0.0.9", "dbX", now.AddDate(0, 0, -1),
+		model.EditionSameCity, fakeCity, fakeDr, 0)
+	if err != nil {
+		t.Fatalf("终态重复上报应幂等成功, got err=%v", err)
+	}
+	if got.ArchiveStatus != model.StatusArchived {
+		t.Errorf("终态被复位: got %s", got.ArchiveStatus)
+	}
+	if got.GFSPath == fakeCity || got.PeerGFSPath == fakeDr {
+		t.Errorf("终态路径被覆盖: gfs=%s peer=%s", got.GFSPath, got.PeerGFSPath)
+	}
+	_ = metaID
+}
+
+// TestInspectExcludesArchived 验证已归档记录不再纳入巡检，不产生误判补发。
+func TestInspectExcludesArchived(t *testing.T) {
+	now := time.Now()
+	svc, _ := archiveOne(t, model.IntPtr(0)) // ARCHIVED
+	res, err := svc.RunInspect(now, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TotalSlots != 0 || res.MissingCount != 0 {
+		t.Fatalf("已归档记录不应纳入巡检: slots=%d missing=%d", res.TotalSlots, res.MissingCount)
+	}
+}
+
+// TestCompleteReplenishPeerVol 验证补发对卷后：主卷路径保留、对卷路径写回补发路径。
+func TestCompleteReplenishPeerVol(t *testing.T) {
+	svc, gfs := newSvc(t)
+	now := time.Now()
+	cl, _ := svc.RegisterCluster(&model.Cluster{ClusterCode: "CL-P", RetentionDays: model.IntPtr(0)})
+	svc.AddClusterInstance(cl.ID, "10.0.0.20", "a", "MASTER")
+	dbm, _ := svc.BindDB(&model.DB{ClusterID: cl.ID, DBName: "dbP", ArchiveWindowDays: 1})
+	day := now.AddDate(0, 0, -1)
+	city, dr := sim.BuildPaths("", "10.0.0.20", "dbP", day.Format("2006-01-02"), string(model.EditionSameCity))
+	gfs.WriteFull(city, 64*1024*1024)
+	gfs.WriteFull(dr, 64*1024*1024)
+	svc.ReportBackupMeta("10.0.0.20", "dbP", day, model.EditionSameCity, city, dr, 0)
+
+	// 删对卷（异地）→ 补发 → 回调
+	gfs.Delete(dr)
+	task, _ := svc.CreateReplenishTask(cl.ID, dbm.ID, "dbP", day, model.EditionSameCity)
+	gfs.WriteFull(dr, 64*1024*1024)
+	if err := svc.CompleteReplenish(task.TaskID, true, dr, 64*1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	var meta model.BackupMeta
+	svc.db.Where("cluster_id = ? AND db_id = ?", cl.ID, dbm.ID).First(&meta)
+	if meta.GFSPath != city {
+		t.Errorf("主卷路径被对卷覆盖: got=%s want=%s", meta.GFSPath, city)
+	}
+	if meta.PeerGFSPath != dr {
+		t.Errorf("对卷路径应为补发路径: got=%s want=%s", meta.PeerGFSPath, dr)
+	}
+	if meta.ArchiveStatus != model.StatusNotArchived {
+		t.Errorf("补发后应回到 NOT_ARCHIVED, got %s", meta.ArchiveStatus)
+	}
+}
+
+// TestFailedRerolledByList 验证 ARCHIVE_FAILED 由下轮滚动清单直接重新纳入（不经过复位）。
+func TestFailedRerolledByList(t *testing.T) {
+	svc, meta := rollingOne(t) // ARCHIVING
+	if err := state.OnArchiveResult(&meta, false); err != nil { // -> ARCHIVE_FAILED
+		t.Fatal(err)
+	}
+	svc.db.Save(&meta)
+
+	// 扫描只做超时兜底，不应改动失败记录
+	timedOut, err := svc.SweepArchive() // 阈值6h，回拨10h场景不受影响
+	if err != nil || timedOut != 0 {
+		t.Fatalf("扫描不应改动失败记录, got timeout=%d err=%v", timedOut, err)
+	}
+
+	// 下轮清单直接把失败项重新纳入 ARCHIVING
+	_, items, err := svc.GenerateRollingList(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].BackupID != meta.ID {
+		t.Fatalf("失败项应被下轮清单重新纳入, got %+v", items)
+	}
+}
+
+// TestSweepTimeout 验证 ARCHIVING 超时被标记为 ARCHIVE_FAILED；未超时不受影响。
+func TestSweepTimeout(t *testing.T) {
+	// 超时：回拨 updated_at 模拟卡死 10h，阈值 1h
+	svc, meta := rollingOne(t) // ARCHIVING
+	svc.db.Model(&model.BackupMeta{}).Where("id = ?", meta.ID).
+		UpdateColumn("updated_at", time.Now().Add(-10*time.Hour))
+	timedOut, err := svc.SweepArchive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timedOut != 1 {
+		t.Fatalf("应超时标记1条, got %d", timedOut)
+	}
+	var got model.BackupMeta
+	svc.db.First(&got, meta.ID)
+	if got.ArchiveStatus != model.StatusArchiveFailed {
+		t.Fatalf("超时应置 ARCHIVE_FAILED, got %s", got.ArchiveStatus)
+	}
+
+	// 未超时：新鲜 ARCHIVING 不会被标记
+	svc2, meta2 := rollingOne(t)
+	timedOut2, _ := svc2.SweepArchive()
+	if timedOut2 != 0 {
+		t.Fatalf("未超时不应标记: timeout=%d", timedOut2)
+	}
+	var got2 model.BackupMeta
+	svc2.db.First(&got2, meta2.ID)
+	if got2.ArchiveStatus != model.StatusArchiving {
+		t.Fatalf("未超时应保持 ARCHIVING, got %s", got2.ArchiveStatus)
+	}
+}
+
+// TestArchiveNotifyRegionRouting 验证多机房下归档清单按主卷机房分发：
+// 同城卷条目发到 cityRegion 的管理端、异地卷条目发到 drRegion 的管理端，互不混淆。
+func TestArchiveNotifyRegionRouting(t *testing.T) {
+	svc, gfs := newSvc(t)
+	now := time.Now()
+
+	// 集群：杭州=同城卷机房，乌兰察布=异地卷机房；两个库（窗口 1 天）
+	cl, _ := svc.RegisterCluster(&model.Cluster{
+		ClusterCode: "CL-REG", CityRegion: "杭州", DRRegion: "乌兰察布",
+	})
+	svc.AddClusterInstance(cl.ID, "10.0.0.30", "a", "MASTER")
+	svc.BindDB(&model.DB{ClusterID: cl.ID, DBName: "dbCity", ArchiveWindowDays: 1})
+	svc.BindDB(&model.DB{ClusterID: cl.ID, DBName: "dbDr", ArchiveWindowDays: 1})
+
+	// 同城版本（主卷 city → 杭州）与异地版本（主卷 dr → 乌兰察布）各 1 份过窗备份
+	day := now.AddDate(0, 0, -1)
+	cityP, drP := sim.BuildPaths("", "10.0.0.30", "dbCity", day.Format("2006-01-02"), string(model.EditionSameCity))
+	gfs.WriteFull(cityP, 64*1024*1024)
+	gfs.WriteFull(drP, 64*1024*1024)
+	svc.ReportBackupMeta("10.0.0.30", "dbCity", day, model.EditionSameCity, cityP, drP, 0)
+
+	cityP2, drP2 := sim.BuildPaths("", "10.0.0.30", "dbDr", day.Format("2006-01-02"), string(model.EditionDisasterRecovery))
+	gfs.WriteFull(cityP2, 64*1024*1024)
+	gfs.WriteFull(drP2, 64*1024*1024)
+	svc.ReportBackupMeta("10.0.0.30", "dbDr", day, model.EditionDisasterRecovery, cityP2, drP2, 0)
+
+	// 两个机房各起一个记录型归档通知端点（记录收到的 gfsPath）
+	var mu sync.Mutex
+	hzPaths, wlcPaths := []string{}, []string{}
+	rec := func(paths *[]string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var in struct {
+				Items []struct {
+					GFSPath string `json:"gfsPath"`
+				} `json:"items"`
+			}
+			json.NewDecoder(r.Body).Decode(&in)
+			mu.Lock()
+			for _, it := range in.Items {
+				*paths = append(*paths, it.GFSPath)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+	hzSrv := httptest.NewServer(rec(&hzPaths))
+	defer hzSrv.Close()
+	wlcSrv := httptest.NewServer(rec(&wlcPaths))
+	defer wlcSrv.Close()
+
+	svc.CreateGfsEndpoint(&model.GfsEndpoint{Region: "杭州", BaseURL: hzSrv.URL})
+	svc.CreateGfsEndpoint(&model.GfsEndpoint{Region: "乌兰察布", BaseURL: wlcSrv.URL})
+
+	batchID, items, err := svc.GenerateRollingList(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("应纳入2条(同城+异地), got %d", len(items))
+	}
+	// 各机房收到各自的条目：杭州=city 路径、乌兰察布=dr 路径
+	if len(hzPaths) != 1 || !strings.Contains(hzPaths[0], "/city/") {
+		t.Fatalf("杭州端点应收到同城卷条目, got %v", hzPaths)
+	}
+	if len(wlcPaths) != 1 || !strings.Contains(wlcPaths[0], "/dr/") {
+		t.Fatalf("乌兰察布端点应收到异地卷条目, got %v", wlcPaths)
+	}
+	var batch model.ArchiveBatch
+	svc.db.First(&batch, "id = ?", batchID)
+	if batch.Status != "PUSHED" {
+		t.Fatalf("全部机房推送成功后批次应 PUSHED, got %s", batch.Status)
 	}
 }

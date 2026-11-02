@@ -26,6 +26,9 @@ type BigData struct {
 
 	// ControlBase 管控系统地址，用于回调归档结果/补发状态。
 	ControlBase string
+
+	// MachineToken 回调管控时携带的机器密钥（X-Machine-Token）；空 = 不带（演示）。
+	MachineToken string
 }
 
 // New 构造大数据组件桩。gfs 为共享的 GFS 实例（写卷用），hdfs 归大数据所有。
@@ -38,6 +41,9 @@ func New(gfs *sim.GFS, hdfs *sim.HDFS) *BigData {
 
 // SetControl 设置管控系统回调地址（回调 /api/v1/archive/result、/api/v1/replenish/task/status）。
 func (b *BigData) SetControl(base string) { b.ControlBase = base }
+
+// SetMachineToken 设置回调管控的机器密钥。
+func (b *BigData) SetMachineToken(tok string) { b.MachineToken = tok }
 
 // Handler 暴露大数据组件 HTTP 接口。
 func (b *BigData) Handler() http.Handler {
@@ -155,11 +161,24 @@ func (b *BigData) postControl(path string, payload map[string]any) {
 		return
 	}
 	body, _ := json.Marshal(payload)
-	resp, err := http.Post(b.ControlBase+path, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, b.ControlBase+path, bytes.NewReader(body))
+	if err != nil {
+		b.log.Printf("回调管控失败 %s: %v", path, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if b.MachineToken != "" {
+		req.Header.Set("X-Machine-Token", b.MachineToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		b.log.Printf("回调管控失败 %s: %v", path, err)
 		return
 	}
 	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b.log.Printf("回调管控被拒 %s -> %d", path, resp.StatusCode)
+		return
+	}
 	b.log.Printf("已回调管控 %s -> %d", path, resp.StatusCode)
 }

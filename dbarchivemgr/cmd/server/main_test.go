@@ -11,15 +11,13 @@ import (
 	"github.com/dbarchivemgr/dbarchivemgr/internal/bigdata"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/gfsclient"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/model"
-	"github.com/dbarchivemgr/dbarchivemgr/internal/notify"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/sim"
 	"github.com/dbarchivemgr/dbarchivemgr/internal/store"
 )
 
-// TestBootstrapExternalWiring 验证「外部组件地址可配置」：
-// 给定 -gfs-url 时，管控经 HTTP 直连外部 GFS 管理端（不再起内置桩、不注入种子）；
-// 归档清单与补发指令都发管理端（清单转发大数据、DB 代理监听同在管理端）。
-// 管控不直连大数据，管控侧不感知 HDFS。
+// TestBootstrapExternalWiring 验证「外部 GFS 模式」：
+// 通过 DBAM_GFS_MAP（含 "*" 兜底）配置管理端后，管控不起内置桩、不注入种子，
+// 出站（stat/delete + 归档清单 + 补发指令）按机房路由打管理端；管控不直连大数据。
 func TestBootstrapExternalWiring(t *testing.T) {
 	// 外部 GFS 网关（/v1/fs/* 为 GFS 管理端；/v1/archive、/v1/replenish 转发大数据桩——模拟管理端转发）
 	gfs := sim.NewGFS("/gfs")
@@ -33,26 +31,30 @@ func TestBootstrapExternalWiring(t *testing.T) {
 		t.Fatalf("store.New: %v", err)
 	}
 
-	// 外部模式：-gfs-url 显式给定
-	c := bootstrap("http://dbam:8080", gfsSrv.URL, "mgr", nil, db)
+	// 外部模式：DBAM_GFS_MAP 配 "*" 兜底（等价于界面「机房管理」配一条 * 行）
+	c := bootstrap("http://dbam:8080", "mgr", map[string]string{"*": gfsSrv.URL}, db)
 	defer c.closeStubs()
 
 	if !c.usesExternalGFS {
-		t.Fatal("期望 usesExternalGFS=true（已配置外部 GFS）")
+		t.Fatal("期望 usesExternalGFS=true（已配置机房映射）")
+	}
+	if c.bd != nil {
+		t.Fatal("外部模式不应起内置大数据桩")
 	}
 	if c.controlBase != "http://dbam:8080" {
 		t.Fatalf("controlBase 应取 -public-url，got %q", c.controlBase)
 	}
-
-	// 补发指令发 GFS 管理端（DB 代理监听同在管理端；此处经网关落到大数据桩应答）。
-	if err := c.svc.Notifier.Notify(notify.ReplenishCandidate{
-		TaskID: "REP-TEST", Path: "/gfs/x", FileSizeBytes: 64,
-	}); err != nil {
-		t.Fatalf("Notify 下发失败: %v", err)
+	// 未匹配/空机房一律回落 "*" 兜底管理端
+	if c.svc.Regions.For("任何机房").(*gfsclient.HTTPFileStore).Base != gfsSrv.URL {
+		t.Fatal("未匹配机房应回落 \"*\" 兜底管理端")
 	}
-	// 归档清单发到 GFS 管理端，由其转发大数据（此处经网关落到大数据桩应答）。
-	if err := c.svc.ArchiveNotifier.NotifyArchive("ARC-TEST", nil); err != nil {
-		t.Fatalf("NotifyArchive 下发失败: %v", err)
+	// 外部模式不注入种子
+	var n int64
+	if err := db.Table("backup_meta").Count(&n).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("外部模式不应注入种子数据, got %d", n)
 	}
 }
 
@@ -62,7 +64,7 @@ func TestBootstrapDemoDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	c := bootstrap("", "", "mgr", nil, db)
+	c := bootstrap("", "mgr", nil, db)
 	defer c.closeStubs()
 	if c.usesExternalGFS {
 		t.Fatal("缺省模式不应 usesExternalGFS")
@@ -94,12 +96,12 @@ func (c *combinedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // TestEnvOr 验证环境变量回退逻辑。
 func TestEnvOr(t *testing.T) {
-	t.Setenv("DBAM_GFS_URL", "http://gfs:1")
-	if got := envOr("DBAM_GFS_URL", "def"); got != "http://gfs:1" {
+	t.Setenv("DBAM_PUBLIC_URL", "http://gfs:1")
+	if got := envOr("DBAM_PUBLIC_URL", "def"); got != "http://gfs:1" {
 		t.Fatalf("envOr 应取环境变量, got %q", got)
 	}
-	t.Setenv("DBAM_GFS_URL", "")
-	if got := envOr("DBAM_GFS_URL", "def"); got != "def" {
+	t.Setenv("DBAM_PUBLIC_URL", "")
+	if got := envOr("DBAM_PUBLIC_URL", "def"); got != "def" {
 		t.Fatalf("envOr 为空时应回退缺省, got %q", got)
 	}
 }
@@ -141,7 +143,7 @@ func TestBootstrapRegionRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	c := bootstrap("", "", "mgr",
+	c := bootstrap("", "mgr",
 		map[string]string{"杭州": hzSrv.URL, "乌兰察布": wlSrv.URL}, db)
 	defer c.closeStubs()
 
@@ -151,7 +153,7 @@ func TestBootstrapRegionRouting(t *testing.T) {
 	if c.svc.Regions == nil {
 		t.Fatal("配置机房映射后 svc.Regions 不应为 nil")
 	}
-	// 未配 -gfs-url 时兜底取映射中字典序首个机房（"乌兰察布"）
+	// 未匹配机房兜底取映射中字典序首个机房（"乌兰察布"）
 	if c.svc.Regions.For("").(*gfsclient.HTTPFileStore).Base != wlSrv.URL {
 		t.Fatal("未匹配机房应回落字典序首个机房的管理端")
 	}
